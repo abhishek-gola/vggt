@@ -320,10 +320,22 @@ class CorrBlock:
         self.corrs_pyramid = []
         for i, fmaps in enumerate(self.fmaps_pyramid):
             *_, H, W = fmaps.shape
-            fmap2s = fmaps.view(B, S, C, H * W)  # B S C H W ->  B S C (H W)
+            # B S C H W ->  B S C (H W)
+            fmap2s = fmaps.view(B, S, C, H * W)
             if self.multiple_track_feats:
                 fmap1 = targets_split[i]
-            corrs = torch.matmul(fmap1, fmap2s)
+            # Chunk spatial dimension to limit memory
+            # Shapes: fmap1 [B,S,N,C], fmap2s [B,S,C,HW]
+            HW = H * W
+            max_hw_chunk = 16384  # tuneable to fit memory
+            corrs_chunks = []
+            for start in range(0, HW, max_hw_chunk):
+                end = min(start + max_hw_chunk, HW)
+                fmap2s_chunk = fmap2s[..., start:end]  # B S C K
+                # (B,S,N,C) x (B,S,C,K) -> (B,S,N,K)
+                corrs_chunk = torch.matmul(fmap1, fmap2s_chunk)
+                corrs_chunks.append(corrs_chunk)
+            corrs = torch.cat(corrs_chunks, dim=-1)
             corrs = corrs.view(B, S, N, H, W)  # B S N (H W) -> B S N H W
             corrs = corrs / torch.sqrt(torch.tensor(C).float())
             self.corrs_pyramid.append(corrs)

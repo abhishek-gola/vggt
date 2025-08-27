@@ -6,6 +6,7 @@
 
 import torch
 import numpy as np
+import torch.nn.functional as F
 from .vggsfm_utils import *
 
 
@@ -17,9 +18,10 @@ def predict_tracks(
     max_query_pts=2048,
     query_frame_num=5,
     keypoint_extractor="aliked+sp",
-    max_points_num=163840,
+    max_points_num=65536,
     fine_tracking=True,
     complete_non_vis=True,
+    tracker_image_res=512,
 ):
     """
     Predict tracks for the given images and masks.
@@ -56,7 +58,8 @@ def predict_tracks(
     tracker = build_vggsfm_tracker().to(device, dtype)
 
     # Find query frames
-    query_frame_indexes = generate_rank_by_dino(images, query_frame_num=query_frame_num, device=device)
+    # Run DINO ranking on CPU to save GPU memory
+    query_frame_indexes = generate_rank_by_dino(images, query_frame_num=query_frame_num, device="cpu")
 
     # Add the first image to the front if not already present
     if 0 in query_frame_indexes:
@@ -74,7 +77,13 @@ def predict_tracks(
     pred_points_3d = []
     pred_colors = []
 
-    fmaps_for_tracker = tracker.process_images_to_fmaps(images)
+    # Downsample images for the tracker to reduce memory
+    if tracker_image_res is not None:
+        images_proc = F.interpolate(images, size=(tracker_image_res, tracker_image_res), mode="bilinear", align_corners=False)
+    else:
+        images_proc = images
+
+    fmaps_for_tracker = tracker.process_images_to_fmaps(images_proc)
 
     if fine_tracking:
         print("For faster inference, consider disabling fine_tracking")
@@ -83,7 +92,7 @@ def predict_tracks(
         print(f"Predicting tracks for query frame {query_index}")
         pred_track, pred_vis, pred_conf, pred_point_3d, pred_color = _forward_on_query(
             query_index,
-            images,
+            images_proc,
             conf,
             points_3d,
             fmaps_for_tracker,

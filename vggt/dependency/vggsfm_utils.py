@@ -67,6 +67,8 @@ def generate_rank_by_dino(
     """
     # Resize images to the target size
     images = F.interpolate(images, (image_size, image_size), mode="bilinear", align_corners=False)
+    if device == "cpu":
+        images = images.cpu()
 
     # Load DINO model
     dino_v2_model = torch.hub.load("facebookresearch/dinov2", model_name)
@@ -253,7 +255,7 @@ def extract_keypoints(query_image, extractors, round_keypoints=True):
 
 
 def predict_tracks_in_chunks(
-    track_predictor, images_feed, query_points_list, fmaps_feed, fine_tracking, num_splits=None, fine_chunk=40960
+    track_predictor, images_feed, query_points_list, fmaps_feed, fine_tracking, num_splits=None, fine_chunk=16384
 ):
     """
     Process a list of query points to avoid memory issues.

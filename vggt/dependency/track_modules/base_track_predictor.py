@@ -99,11 +99,19 @@ class BaseTrackerPredictor(nn.Module):
         # back up the init coords
         coords_backup = coords.clone()
 
-        # Construct the correlation block
-
-        fcorr_fn = CorrBlock(fmaps, num_levels=self.corr_levels, radius=self.corr_radius)
-
+        # Construct the correlation block with optional temporal windowing to reduce memory
+        # Here we optionally slice frames in windows if S is large
+        temporal_window = 16 if S > 24 else S
         coord_preds = []
+
+        # If we window, we will iterate over temporal chunks and accumulate
+        windows = []
+        if temporal_window < S:
+            for start in range(0, S, temporal_window):
+                end = min(start + temporal_window, S)
+                windows.append((start, end))
+        else:
+            windows = [(0, S)]
 
         # Iterative Refinement
         for itr in range(iters):
@@ -111,10 +119,14 @@ class BaseTrackerPredictor(nn.Module):
             # (in my experience, not very important for performance)
             coords = coords.detach()
 
-            # Compute the correlation (check the implementation of CorrBlock)
-
-            fcorr_fn.corr(track_feats)
-            fcorrs = fcorr_fn.sample(coords)  # B, S, N, corrdim
+            # Compute correlation per temporal window
+            corrs_pieces = []
+            for (ws, we) in windows:
+                fcorr_fn = CorrBlock(fmaps[:, ws:we], num_levels=self.corr_levels, radius=self.corr_radius)
+                fcorr_fn.corr(track_feats[:, ws:we])
+                fcorrs_piece = fcorr_fn.sample(coords[:, ws:we])  # B, wS, N, corrdim
+                corrs_pieces.append(fcorrs_piece)
+            fcorrs = torch.cat(corrs_pieces, dim=1)  # B, S, N, corrdim
 
             corrdim = fcorrs.shape[3]
 
