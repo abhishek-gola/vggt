@@ -24,6 +24,11 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 
+# Enable lower-precision fast kernels to reduce memory
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 print("Initializing and loading VGGT model...")
@@ -71,8 +76,19 @@ def run_model(target_dir, model) -> dict:
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
     with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=dtype):
-            predictions = model(images)
+        # Prefer memory efficient/flash SDPA kernels
+        if torch.cuda.is_available():
+            ctx = torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True)
+        else:
+            class _DummyCtx:
+                def __enter__(self):
+                    return self
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+            ctx = _DummyCtx()
+        with ctx:
+            with torch.cuda.amp.autocast(dtype=dtype):
+                predictions = model(images)
 
     # Convert pose encoding to extrinsic and intrinsic matrices
     print("Converting pose encoding to extrinsic and intrinsic matrices...")
@@ -93,6 +109,7 @@ def run_model(target_dir, model) -> dict:
     predictions["world_points_from_depth"] = world_points
 
     # Clean up
+    del images
     torch.cuda.empty_cache()
     return predictions
 

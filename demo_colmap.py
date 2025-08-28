@@ -59,6 +59,12 @@ def parse_args():
     parser.add_argument(
         "--conf_thres_value", type=float, default=5.0, help="Confidence threshold value for depth filtering (wo BA)"
     )
+    parser.add_argument(
+        "--tracker_image_res", type=int, default=512, help="Resolution used by the tracker for keypoint matching"
+    )
+    parser.add_argument(
+        "--min_inlier_per_frame", type=int, default=64, help="Minimum number of inliers required per frame for BA"
+    )
     return parser.parse_args()
 
 
@@ -161,7 +167,14 @@ def demo_fn(args):
                 query_frame_num=args.query_frame_num,
                 keypoint_extractor="aliked+sp",
                 fine_tracking=args.fine_tracking,
+                tracker_image_res=args.tracker_image_res,
             )
+
+            # Rescale tracks from tracker resolution to the BA image resolution (img_load_resolution)
+            # BA cameras are set using intrinsics rescaled to img_load_resolution, so tracks must match
+            if args.tracker_image_res is not None:
+                track_scale = img_load_resolution / float(args.tracker_image_res)
+                pred_tracks *= track_scale
 
             torch.cuda.empty_cache()
 
@@ -181,6 +194,7 @@ def demo_fn(args):
             shared_camera=shared_camera,
             camera_type=args.camera_type,
             points_rgb=points_rgb,
+            min_inlier_per_frame=args.min_inlier_per_frame,
         )
 
         if reconstruction is None:
