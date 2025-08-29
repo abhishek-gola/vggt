@@ -507,8 +507,12 @@ def main():
     if not os.path.isdir(args.query_dir):
         raise FileNotFoundError(f"Query directory not found: {args.query_dir}")
 
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-    entries = sorted([e for e in os.listdir(args.query_dir) if os.path.splitext(e)[1].lower() in exts])
+    # exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    # entries = sorted([e for e in os.listdir(args.query_dir) if os.path.splitext(e)[1].lower() in exts])
+    entries = sorted([e for e in os.listdir(args.query_dir)])
+    entries = entries[:643]
+    entries = entries[::-1]
+    print("entries: ", entries[:5])
 
     if len(entries) == 0:
         raise RuntimeError(f"No images found in directory: {args.query_dir}")
@@ -536,22 +540,22 @@ def main():
                     f"{name} {qwxyz_t[0]:.8f} {qwxyz_t[1]:.8f} {qwxyz_t[2]:.8f} {qwxyz_t[3]:.8f} {qwxyz_t[4]:.6f} {qwxyz_t[5]:.6f} {qwxyz_t[6]:.6f}\n"
                 )
                 f.flush()
-                num_corr = int(dbg.get("num_corr", np.array([0], dtype=np.int32))[0])
-                num_inl = int(dbg.get("num_inliers", np.array([0], dtype=np.int32))[0])
-                print(f"OK {name}: corr={num_corr}, inliers={num_inl}", flush=True)
-                count_success += 1
+                # num_corr = int(dbg.get("num_corr", np.array([0], dtype=np.int32))[0])
+                # num_inl = int(dbg.get("num_inliers", np.array([0], dtype=np.int32))[0])
+                # print(f"OK {name}: corr={num_corr}, inliers={num_inl}", flush=True)
+                # count_success += 1
             except Exception as e:
                 failures.append((name, str(e)))
                 print(f"FAIL {name}: {e}", flush=True)
                 continue
 
-    print(f"Processed {count_success} images, {len(failures)} failed. Saved poses to {args.output_txt}")
-    if failures:
-        print("Failures (image -> reason):")
-        for name, reason in failures[:20]:
-            print(f"  {name} -> {reason}")
-        if len(failures) > 20:
-            print(f"  ... and {len(failures) - 20} more")
+    # print(f"Processed {count_success} images, {len(failures)} failed. Saved poses to {args.output_txt}")
+    # if failures:
+    #     print("Failures (image -> reason):")
+    #     for name, reason in failures[:20]:
+    #         print(f"  {name} -> {reason}")
+    #     if len(failures) > 20:
+    #         print(f"  ... and {len(failures) - 20} more")
 
 
 if __name__ == "__main__":

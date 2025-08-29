@@ -67,6 +67,7 @@ def _parse_pose_line(line: str):
     Returns (frame_id, q_wxyz (4,), t (3,) or None if absent)
     """
     raw = line.strip()
+    print("raw: ", raw)
     if not raw or raw.startswith('#'):
         return None
     parts = raw.split()
@@ -74,6 +75,8 @@ def _parse_pose_line(line: str):
         return None
     frame_id = parts[0]
     nums = [float(x) for x in parts[1:]]
+    print("nums: ", nums)
+    print("frame_id: ", frame_id)
     if len(nums) >= 7:
         q = np.array(nums[:4], dtype=float)
         t = np.array(nums[4:7], dtype=float)
@@ -97,6 +100,8 @@ def process_file_of_rel_quaternions(input_path: str, output_path: str,
         lines = f.readlines()
 
     # Current absolute pose accumulators
+    q_init = np.array(q_init, dtype=float).reshape(4)
+    t_init = np.array(t_init, dtype=float).reshape(3)
     q_curr = np.array(q_init, dtype=float).reshape(4)
     t_curr = np.array(t_init, dtype=float).reshape(3)
 
@@ -111,7 +116,7 @@ def process_file_of_rel_quaternions(input_path: str, output_path: str,
         R_rel = R.from_quat(wxyz_to_xyzw(q_rel_wxyz)).as_matrix()
 
         # Compose with current absolute
-        _, t_abs, q_abs_wxyz, _ = compose_absolute_from_relative(R_rel, t_rel, q_curr, t_curr)
+        _, t_abs, q_abs_wxyz, _ = compose_absolute_from_relative(R_rel, t_rel, q_init, t_init)
 
         # Update accumulators
         q_curr = q_abs_wxyz
