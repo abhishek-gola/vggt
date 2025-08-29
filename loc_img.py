@@ -16,6 +16,7 @@ from PIL import Image
 from vggt.dependency.vggsfm_utils import initialize_feature_extractors
 import pycolmap
 import trimesh
+from vggt.utils.rotation import mat_to_quat
 
 
 # ----------------------------- Utilities ---------------------------------- #
@@ -449,10 +450,25 @@ def localize_query_image(
     return extrinsic, K, debug
 
 
+# New helper to convert extrinsic [R|t] (cam_from_world) to (qw, qx, qy, qz, tx, ty, tz)
+def _extrinsic_to_qwxyz_txyz(extrinsic: np.ndarray) -> Tuple[float, float, float, float, float, float, float]:
+    R = extrinsic[:, :3].astype(np.float32)
+    t = extrinsic[:, 3].astype(np.float32)
+    # mat_to_quat returns (x, y, z, w) with scalar last; convert to scalar-first (w, x, y, z)
+    quat_xyzw = mat_to_quat(torch.from_numpy(R)[None, ...]).detach().cpu().numpy()[0]
+    qwxyz = (float(quat_xyzw[3]), float(quat_xyzw[0]), float(quat_xyzw[1]), float(quat_xyzw[2]))
+    return (*qwxyz, float(t[0]), float(t[1]), float(t[2]))
+
+
+# ------------------------------ Main logic --------------------------------- #
+
 def main():
     parser = argparse.ArgumentParser(description="Localize a query image against a VGGT/pycolmap reconstruction.")
     parser.add_argument("--scene_dir", type=str, required=True, help="Directory with images/ and sparse/ from demo_colmap.py")
-    parser.add_argument("--query_image", type=str, required=True, help="Path to query image to localize")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--query_image", type=str, help="Path to a single query image to localize")
+    group.add_argument("--query_dir", type=str, help="Path to a directory of query images to localize")
+    parser.add_argument("--output_txt", type=str, default="poses.txt", help="Output txt file to write poses as: name qw qx qy qz tx ty tz")
     parser.add_argument("--extractor", type=str, default="aliked+sp", help="Feature extractor combo, e.g., 'aliked+sp' or 'aliked+sp+sift'")
     parser.add_argument("--top_k_db", type=int, default=20, help="Number of database images to match (retrieved by pHash)")
     parser.add_argument("--px_thresh_snap", type=float, default=3.0, help="Max px distance to snap db keypoint to recon 2D point")
@@ -461,23 +477,81 @@ def main():
     parser.add_argument("--extractor_max_long_side", type=int, default=2048, help="Resizes inputs for extractor; kpts are scaled back")
     args = parser.parse_args()
 
-    extrinsic, K, dbg = localize_query_image(
-        scene_dir=args.scene_dir,
-        query_image_path=args.query_image,
-        extractor_method=args.extractor,
-        top_k_db=args.top_k_db,
-        px_thresh_snap=args.px_thresh_snap,
-        ransac_reproj_error=args.ransac_reproj_error,
-        min_pnp_inliers=args.min_pnp_inliers,
-        extractor_max_long_side=args.extractor_max_long_side,
-    )
+    if args.query_dir is None:
+        # Single-image mode
+        extrinsic, K, dbg = localize_query_image(
+            scene_dir=args.scene_dir,
+            query_image_path=args.query_image,
+            extractor_method=args.extractor,
+            top_k_db=args.top_k_db,
+            px_thresh_snap=args.px_thresh_snap,
+            ransac_reproj_error=args.ransac_reproj_error,
+            min_pnp_inliers=args.min_pnp_inliers,
+            extractor_max_long_side=args.extractor_max_long_side,
+        )
 
-    print("Localization successful.")
-    print("Estimated extrinsic (cam_from_world [R|t]):")
-    print(extrinsic)
-    print("Estimated intrinsics K:")
-    print(K)
-    print(f"Num correspondences: {int(dbg['num_corr'][0])}, inliers: {int(dbg['num_inliers'][0])}")
+        print("Localization successful.")
+        print("Estimated extrinsic (cam_from_world [R|t]):")
+        print(extrinsic)
+        print("Estimated intrinsics K:")
+        print(K)
+        print(f"Num correspondences: {int(dbg['num_corr'][0])}, inliers: {int(dbg['num_inliers'][0])}")
+
+        qwxyz_t = _extrinsic_to_qwxyz_txyz(extrinsic)
+        with open(args.output_txt, "a") as f:
+            f.write(f"{os.path.basename(args.query_image)} {qwxyz_t[0]:.8f} {qwxyz_t[1]:.8f} {qwxyz_t[2]:.8f} {qwxyz_t[3]:.8f} {qwxyz_t[4]:.6f} {qwxyz_t[5]:.6f} {qwxyz_t[6]:.6f}\n")
+        print(f"Saved pose to {args.output_txt}")
+        return
+
+    # Directory mode
+    if not os.path.isdir(args.query_dir):
+        raise FileNotFoundError(f"Query directory not found: {args.query_dir}")
+
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    entries = sorted([e for e in os.listdir(args.query_dir) if os.path.splitext(e)[1].lower() in exts])
+
+    if len(entries) == 0:
+        raise RuntimeError(f"No images found in directory: {args.query_dir}")
+
+    failures = []
+    count_success = 0
+    with open(args.output_txt, "w") as f:
+        for name in entries:
+            qpath = os.path.join(args.query_dir, name)
+            try:
+                print(f"Processing {name} ...", flush=True)
+                extrinsic, K, dbg = localize_query_image(
+                    scene_dir=args.scene_dir,
+                    query_image_path=qpath,
+                    extractor_method=args.extractor,
+                    top_k_db=args.top_k_db,
+                    px_thresh_snap=args.px_thresh_snap,
+                    ransac_reproj_error=args.ransac_reproj_error,
+                    min_pnp_inliers=args.min_pnp_inliers,
+                    extractor_max_long_side=args.extractor_max_long_side,
+                )
+                qwxyz_t = _extrinsic_to_qwxyz_txyz(extrinsic)
+                # write one line per image immediately
+                f.write(
+                    f"{name} {qwxyz_t[0]:.8f} {qwxyz_t[1]:.8f} {qwxyz_t[2]:.8f} {qwxyz_t[3]:.8f} {qwxyz_t[4]:.6f} {qwxyz_t[5]:.6f} {qwxyz_t[6]:.6f}\n"
+                )
+                f.flush()
+                num_corr = int(dbg.get("num_corr", np.array([0], dtype=np.int32))[0])
+                num_inl = int(dbg.get("num_inliers", np.array([0], dtype=np.int32))[0])
+                print(f"OK {name}: corr={num_corr}, inliers={num_inl}", flush=True)
+                count_success += 1
+            except Exception as e:
+                failures.append((name, str(e)))
+                print(f"FAIL {name}: {e}", flush=True)
+                continue
+
+    print(f"Processed {count_success} images, {len(failures)} failed. Saved poses to {args.output_txt}")
+    if failures:
+        print("Failures (image -> reason):")
+        for name, reason in failures[:20]:
+            print(f"  {name} -> {reason}")
+        if len(failures) > 20:
+            print(f"  ... and {len(failures) - 20} more")
 
 
 if __name__ == "__main__":

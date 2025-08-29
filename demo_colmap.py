@@ -75,12 +75,30 @@ def run_VGGT(model, images, dtype, resolution=518):
     assert images.shape[1] == 3
 
     # hard-coded to use 518 for VGGT
+    # Downsample on CPU first to reduce GPU memory peak, then move to device
     images = F.interpolate(images, size=(resolution, resolution), mode="bilinear", align_corners=False)
+    images = images.to(next(model.parameters()).device)
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
             images = images[None]  # add batch dimension
-            aggregated_tokens_list, ps_idx = model.aggregator(images)
+            # Enable gradient checkpointing for aggregator to reduce memory during inference
+            prev_agg_training = model.aggregator.training
+            model.aggregator.train()
+            # Keep only the layers needed by heads to save memory
+            # DPTHead default indices are [4, 11, 17, 23]; CameraHead uses the last one
+            keep_layer_indices = [4, 11, 17, 23]
+            aggregated_tokens_list, ps_idx = model.aggregator(images, keep_output_indices=keep_layer_indices)
+            # Restore original mode
+            if not prev_agg_training:
+                model.aggregator.eval()
+
+            # Update heads to index into the pruned list
+            if model.depth_head is not None:
+                model.depth_head.intermediate_layer_idx = [0, 1, 2, 3]
+            if model.point_head is not None:
+                model.point_head.intermediate_layer_idx = [0, 1, 2, 3]
+            torch.cuda.empty_cache()
 
         # Predict Cameras
         pose_enc = model.camera_head(aggregated_tokens_list)[-1]
@@ -88,6 +106,9 @@ def run_VGGT(model, images, dtype, resolution=518):
         extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
         # Predict Depth Maps
         depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
+        # Free large token tensors asap
+        del aggregated_tokens_list
+        torch.cuda.empty_cache()
 
     extrinsic = extrinsic.squeeze(0).cpu().numpy()
     intrinsic = intrinsic.squeeze(0).cpu().numpy()
@@ -136,12 +157,14 @@ def demo_fn(args):
     img_load_resolution = 1024
 
     images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution)
-    images = images.to(device)
+    # Keep images on CPU for now to reduce peak GPU memory; we'll move needed tensors later
     original_coords = original_coords.to(device)
     print(f"Loaded {len(images)} images from {image_dir}")
 
     # Run VGGT to estimate camera and depth
     # Run with 518x518 images
+    # Move images to device lazily right before model forward to reduce peak memory
+    images = images.to(device)
     extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution)
     points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
 
@@ -158,8 +181,10 @@ def demo_fn(args):
 
             # You can also change the pred_tracks to tracks from any other methods
             # e.g., from COLMAP, from CoTracker, or by chaining 2D matches from Lightglue/LoFTR.
+            # Move images to GPU only for tracking to avoid keeping large 1024 tensors on GPU throughout
+            images_gpu = images.to(device)
             pred_tracks, pred_vis_scores, pred_confs, points_3d, points_rgb = predict_tracks(
-                images,
+                images_gpu,
                 conf=depth_conf,
                 points_3d=points_3d,
                 masks=None,
@@ -169,6 +194,9 @@ def demo_fn(args):
                 fine_tracking=args.fine_tracking,
                 tracker_image_res=args.tracker_image_res,
             )
+
+            del images_gpu
+            torch.cuda.empty_cache()
 
             # Rescale tracks from tracker resolution to the BA image resolution (img_load_resolution)
             # BA cameras are set using intrinsics rescaled to img_load_resolution, so tracks must match

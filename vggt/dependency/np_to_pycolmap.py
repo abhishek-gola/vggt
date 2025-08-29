@@ -58,6 +58,9 @@ def batch_np_matrix_to_pycolmap(
         projected_diff = np.linalg.norm(projected_points_2d - tracks, axis=-1)
         projected_points_2d[projected_points_cam[:, -1] <= 0] = 1e6
         reproj_mask = projected_diff < max_reproj_error
+        print("projection error: ", projected_diff)
+        print("max_reproj_error: ", max_reproj_error)
+        print("reproj_mask: ", reproj_mask)
 
     if masks is not None and reproj_mask is not None:
         masks = np.logical_and(masks, reproj_mask)
