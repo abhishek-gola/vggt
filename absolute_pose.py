@@ -128,7 +128,7 @@ def process_file_of_rel_quaternions(input_path: str, output_path: str,
             f"{t_curr[0]:.8f} {t_curr[1]:.8f} {t_curr[2]:.8f}\n"
         )
 
-    with open(output_path, 'a') as f:
+    with open(output_path, 'w') as f:
         f.writelines(out_lines)
 
     return len(out_lines)
@@ -137,8 +137,12 @@ def process_file_of_rel_quaternions(input_path: str, output_path: str,
 if __name__ == "__main__":
     # ======== USER INPUTS (replace with yours) ========
     # Fixed init pose (world->cam): (qw, qx, qy, qz, tx, ty, tz)
-    q_init = np.array([0.534053, 0.447417, -0.473307, 0.53906], dtype=float)
-    t_init = np.array([3.66724, 1.69314, -1.05368], dtype=float)
+    q_init = np.array([0.631464,0.753969,0.137941,-0.117284 ], dtype=float)
+    t_init = np.array([-2.4357,1.73943,0.164075], dtype=float)
+    # q_init = np.array([0.534053, 0.447417, -0.473307, 0.53906], dtype=float)
+    # t_init = np.array([3.66724, 1.69314, -1.05368], dtype=float)
+
+
     # q_init = np.array([0.631464, 0.753969, 0.137941, -0.117284], dtype=float)
     # t_init = np.array([-2.4357, 1.73943, 0.164075], dtype=float)
 

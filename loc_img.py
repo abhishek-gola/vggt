@@ -6,11 +6,12 @@ import argparse
 import os
 from typing import Dict, List, Tuple, Optional
 from collections import Counter
-
+import time
 import numpy as np
 import torch
 import cv2
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Local imports
 from vggt.dependency.vggsfm_utils import initialize_feature_extractors
@@ -261,6 +262,9 @@ def localize_query_image(
     px_thresh_snap: float = 3.0,
     ransac_reproj_error: float = 8.0,
     extractor_max_long_side: int = 2048,
+    prepared_scene: Optional[Dict] = None,
+    extractors: Optional[Dict[str, torch.nn.Module]] = None,
+    device: Optional[torch.device] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
     """
     Localize a query image against an existing COLMAP reconstruction.
@@ -270,43 +274,54 @@ def localize_query_image(
     - Use perceptual-hash retrieval to actually pick top-K neighbors.
     - Ratio test applied in distance domain for cosine-based descriptors.
     - Intrinsics estimated from the subset of retrieved db images.
+    - Reuses reconstruction and feature extractors when provided for speed.
     """
     sparse_dir = os.path.join(scene_dir, "sparse")
     if not os.path.isdir(sparse_dir):
         raise FileNotFoundError(f"No sparse reconstruction found at {sparse_dir}")
 
-    recon = pycolmap.Reconstruction(sparse_dir)
+    if prepared_scene is None:
+        recon = pycolmap.Reconstruction(sparse_dir)
 
-    images_dir = os.path.join(scene_dir, "images")
-    if not os.path.isdir(images_dir):
-        raise FileNotFoundError(f"No images/ folder found at {images_dir}")
+        images_dir = os.path.join(scene_dir, "images")
+        if not os.path.isdir(images_dir):
+            raise FileNotFoundError(f"No images/ folder found at {images_dir}")
 
-    # Build fast map: image_id -> (name, path, registered 2D-3D)
-    id_to_item = {}
-    db_id_and_paths = []
-    for image_id, img in recon.images.items():
-        name = img.name
-        image_path = os.path.join(images_dir, name)
-        points2d_xy = []
-        points3d_xyz = []
-        for p2d in img.points2D:
-            pid = p2d.point3D_id
-            if pid == -1:
-                continue
-            xy = p2d.xy
-            points2d_xy.append(np.array([xy[0], xy[1]], dtype=np.float32))
-            p3d = recon.points3D[pid]
-            points3d_xyz.append(p3d.xyz.astype(np.float32))
-        if len(points2d_xy) > 0:
-            id_to_item[image_id] = (image_path, np.stack(points2d_xy, axis=0), np.stack(points3d_xyz, axis=0))
-        db_id_and_paths.append((image_id, image_path))
+        # Build fast map: image_id -> (name, path, registered 2D-3D)
+        id_to_item = {}
+        db_id_and_paths = []
+        for image_id, img in recon.images.items():
+            name = img.name
+            image_path = os.path.join(images_dir, name)
+            points2d_xy = []
+            points3d_xyz = []
+            for p2d in img.points2D:
+                pid = p2d.point3D_id
+                if pid == -1:
+                    continue
+                xy = p2d.xy
+                points2d_xy.append(np.array([xy[0], xy[1]], dtype=np.float32))
+                p3d = recon.points3D[pid]
+                points3d_xyz.append(p3d.xyz.astype(np.float32))
+            if len(points2d_xy) > 0:
+                id_to_item[image_id] = (image_path, np.stack(points2d_xy, axis=0), np.stack(points3d_xyz, axis=0))
+            db_id_and_paths.append((image_id, image_path))
+        proj_pts3d_pre = None
+    else:
+        recon = prepared_scene["recon"]
+        images_dir = prepared_scene["images_dir"]
+        id_to_item = prepared_scene["id_to_item"]
+        db_id_and_paths = prepared_scene["db_id_and_paths"]
+        proj_pts3d_pre = prepared_scene.get("proj_pts3d", None)
 
     # Load query in ORIGINAL size and also prepare resized tensor for extractor
     q_tensor_resized, (qW, qH), (q_sx, q_sy) = _prepare_image_for_extractor(query_image_path, extractor_max_long_side)
 
     # Initialize extractors
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    extractors = initialize_feature_extractors(extractor_max_long_side, extractor_method=extractor_method, device=device)
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if extractors is None:
+        extractors = initialize_feature_extractors(extractor_max_long_side, extractor_method=extractor_method, device=device)
 
     # Extract query features (and scale them back to original pixel frame)
     feats_q = _extract_features_with_scaling(q_tensor_resized, extractors, device, (q_sx, q_sy))
@@ -322,9 +337,9 @@ def localize_query_image(
     # Check if we have registered 2D-3D tracks at all
     use_projection_fallback = (len(id_to_item) == 0)
 
-    # Precompute 3D points for fallback projection
-    proj_pts3d = None
-    if use_projection_fallback:
+    # Precompute 3D points for fallback projection (reuse if provided)
+    proj_pts3d = proj_pts3d_pre
+    if use_projection_fallback and proj_pts3d is None:
         pts_list = [recon.points3D[pid].xyz.astype(np.float32) for pid in recon.points3D]
         if not pts_list:
             ply_path = os.path.join(sparse_dir, "points.ply")
@@ -421,8 +436,29 @@ def localize_query_image(
             Ks.append(recon.cameras[dom_cam_id].calibration_matrix())
     if Ks:
         K = np.median(np.stack(Ks, axis=0), axis=0).astype(np.float32)
+        ref_w = float(recon.cameras[dom_cam_id].width)
+        ref_h = float(recon.cameras[dom_cam_id].height)
     else:
         K = _median_intrinsics_from_subset(recon, retrieved_ids)
+        # Fallback: use median width/height of retrieved cameras as reference
+        ref_ws = []
+        ref_hs = []
+        for iid in retrieved_ids:
+            cam_i = recon.cameras[recon.images[iid].camera_id]
+            ref_ws.append(float(cam_i.width))
+            ref_hs.append(float(cam_i.height))
+        ref_w = float(np.median(ref_ws)) if len(ref_ws) > 0 else float(qW)
+        ref_h = float(np.median(ref_hs)) if len(ref_hs) > 0 else float(qH)
+
+    # Scale K to the query image pixel grid if resolutions differ
+    sx_k = float(qW) / max(ref_w, 1e-8)
+    sy_k = float(qH) / max(ref_h, 1e-8)
+    if (abs(sx_k - 1.0) > 1e-6) or (abs(sy_k - 1.0) > 1e-6):
+        K = K.copy()
+        K[0, 0] *= sx_k
+        K[1, 1] *= sy_k
+        K[0, 2] *= sx_k
+        K[1, 2] *= sy_k
 
     # PnP RANSAC
     success, rvec, tvec, inliers = cv2.solvePnPRansac(
@@ -475,6 +511,7 @@ def main():
     parser.add_argument("--ransac_reproj_error", type=float, default=8.0, help="RANSAC reprojection error in pixels")
     parser.add_argument("--min_pnp_inliers", type=int, default=64, help="Minimum inliers to accept PnP solution")
     parser.add_argument("--extractor_max_long_side", type=int, default=2048, help="Resizes inputs for extractor; kpts are scaled back")
+    parser.add_argument("--num_workers", type=int, default=6, help="Number of parallel threads for directory mode")
     args = parser.parse_args()
 
     if args.query_dir is None:
@@ -510,46 +547,96 @@ def main():
     # exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
     # entries = sorted([e for e in os.listdir(args.query_dir) if os.path.splitext(e)[1].lower() in exts])
     entries = sorted([e for e in os.listdir(args.query_dir)])
-    entries = entries[:643]
+    entries = entries[:722]
     entries = entries[::-1]
     print("entries: ", entries[:5])
 
     if len(entries) == 0:
         raise RuntimeError(f"No images found in directory: {args.query_dir}")
 
-    failures = []
-    count_success = 0
-    with open(args.output_txt, "w") as f:
-        for name in entries:
-            qpath = os.path.join(args.query_dir, name)
-            try:
-                print(f"Processing {name} ...", flush=True)
-                extrinsic, K, dbg = localize_query_image(
-                    scene_dir=args.scene_dir,
-                    query_image_path=qpath,
-                    extractor_method=args.extractor,
-                    top_k_db=args.top_k_db,
-                    px_thresh_snap=args.px_thresh_snap,
-                    ransac_reproj_error=args.ransac_reproj_error,
-                    min_pnp_inliers=args.min_pnp_inliers,
-                    extractor_max_long_side=args.extractor_max_long_side,
-                )
-                qwxyz_t = _extrinsic_to_qwxyz_txyz(extrinsic)
-                # write one line per image immediately
-                f.write(
-                    f"{name} {qwxyz_t[0]:.8f} {qwxyz_t[1]:.8f} {qwxyz_t[2]:.8f} {qwxyz_t[3]:.8f} {qwxyz_t[4]:.6f} {qwxyz_t[5]:.6f} {qwxyz_t[6]:.6f}\n"
-                )
-                f.flush()
-                # num_corr = int(dbg.get("num_corr", np.array([0], dtype=np.int32))[0])
-                # num_inl = int(dbg.get("num_inliers", np.array([0], dtype=np.int32))[0])
-                # print(f"OK {name}: corr={num_corr}, inliers={num_inl}", flush=True)
-                # count_success += 1
-            except Exception as e:
-                failures.append((name, str(e)))
-                print(f"FAIL {name}: {e}", flush=True)
+    # Prepare shared scene and extractors once
+    recon = pycolmap.Reconstruction(os.path.join(args.scene_dir, "sparse"))
+    images_dir = os.path.join(args.scene_dir, "images")
+    if not os.path.isdir(images_dir):
+        raise FileNotFoundError(f"No images/ folder found at {images_dir}")
+    
+    id_to_item = {}
+    db_id_and_paths = []
+    for image_id, img in recon.images.items():
+        name = img.name
+        image_path = os.path.join(images_dir, name)
+        points2d_xy = []
+        points3d_xyz = []
+        for p2d in img.points2D:
+            pid = p2d.point3D_id
+            if pid == -1:
                 continue
+            xy = p2d.xy
+            points2d_xy.append(np.array([xy[0], xy[1]], dtype=np.float32))
+            p3d = recon.points3D[pid]
+            points3d_xyz.append(p3d.xyz.astype(np.float32))
+        if len(points2d_xy) > 0:
+            id_to_item[image_id] = (image_path, np.stack(points2d_xy, axis=0), np.stack(points3d_xyz, axis=0))
+        db_id_and_paths.append((image_id, image_path))
 
-    # print(f"Processed {count_success} images, {len(failures)} failed. Saved poses to {args.output_txt}")
+    prepared_scene = {
+        "recon": recon,
+        "images_dir": images_dir,
+        "id_to_item": id_to_item,
+        "db_id_and_paths": db_id_and_paths,
+    }
+
+    shared_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    shared_extractors = initialize_feature_extractors(
+        args.extractor_max_long_side, extractor_method=args.extractor, device=shared_device
+    )
+
+    failures = []
+    with open(args.output_txt, "w") as f:
+        def _process(name: str):
+            qpath = os.path.join(args.query_dir, name)
+            extrinsic, K, dbg = localize_query_image(
+                scene_dir=args.scene_dir,
+                query_image_path=qpath,
+                extractor_method=args.extractor,
+                top_k_db=args.top_k_db,
+                px_thresh_snap=args.px_thresh_snap,
+                ransac_reproj_error=args.ransac_reproj_error,
+                min_pnp_inliers=args.min_pnp_inliers,
+                extractor_max_long_side=args.extractor_max_long_side,
+                prepared_scene=prepared_scene,
+                extractors=shared_extractors,
+                device=shared_device,
+            )
+            qwxyz_t = _extrinsic_to_qwxyz_txyz(extrinsic)
+            line = (
+                f"{name} {qwxyz_t[0]:.8f} {qwxyz_t[1]:.8f} {qwxyz_t[2]:.8f} {qwxyz_t[3]:.8f} "
+                f"{qwxyz_t[4]:.6f} {qwxyz_t[5]:.6f} {qwxyz_t[6]:.6f}\n"
+            )
+            num_corr = int(dbg.get("num_corr", np.array([0], dtype=np.int32))[0])
+            num_inl = int(dbg.get("num_inliers", np.array([0], dtype=np.int32))[0])
+            return name, line, num_corr, num_inl
+        start_time=time.time()
+        with ThreadPoolExecutor(max_workers=max(1, int(args.num_workers))) as executor:
+            futures = {executor.submit(_process, name): name for name in entries}
+            for fut in as_completed(futures):
+                name = futures[fut]
+                try:
+                    name, line, num_corr, num_inl = fut.result()
+                    f.write(line)
+                    f.flush()
+                    # print status per image
+                    print(f"OK {name}: corr={num_corr}, inliers={num_inl}")
+                except Exception as e:
+                    failures.append((name, str(e)))
+                    print(f"FAIL {name}: {e}", flush=True)
+        end_time=time.time()
+
+        duration = end_time - start_time
+
+        print(f"Total inference time in seconds:{duration}")
+        print(f"Average time per frame: {duration/len(entries)}")
+    # print(f"Processed {len(entries) - len(failures)} images, {len(failures)} failed. Saved poses to {args.output_txt}")
     # if failures:
     #     print("Failures (image -> reason):")
     #     for name, reason in failures[:20]:

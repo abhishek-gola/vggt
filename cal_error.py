@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import math
-from typing import Tuple, List
+from typing import Tuple, List, Dict, Optional
+import argparse
+import re
 
 
 def parse_pose_from_line(line: str) -> Tuple[List[float], List[float]]:
@@ -64,6 +66,35 @@ def translation_error(t1, t2):
     return dist, (dx, dy, dz)
 
 
+# === New helpers: camera center error (origin-shift robust) ===
+
+def quat_wxyz_to_R(q):
+    q = q_normalize(q)
+    w, x, y, z = q
+    xx, yy, zz = x*x, y*y, z*z
+    xy, xz, yz = x*y, x*z, y*z
+    wx, wy, wz = w*x, w*y, w*z
+    return [
+        [1 - 2*(yy + zz),     2*(xy - wz),         2*(xz + wy)    ],
+        [2*(xy + wz),         1 - 2*(xx + zz),     2*(yz - wx)    ],
+        [2*(xz - wy),         2*(yz + wx),         1 - 2*(xx + yy)]
+    ]
+
+
+def camera_center_from_qt(q, t):
+    # For world->cam: x_cam = R X_w + t, the camera center is C = -R^T t
+    R = quat_wxyz_to_R(q)
+    # R^T t
+    r00, r01, r02 = R[0]
+    r10, r11, r12 = R[1]
+    r20, r21, r22 = R[2]
+    tx, ty, tz = t
+    Rt_t_x = r00*tx + r10*ty + r20*tz
+    Rt_t_y = r01*tx + r11*ty + r21*tz
+    Rt_t_z = r02*tx + r12*ty + r22*tz
+    return [-Rt_t_x, -Rt_t_y, -Rt_t_z]
+
+
 def compute_pair_error(line1: str, line2: str):
     q1, t1 = parse_pose_from_line(line1)
     q2, t2 = parse_pose_from_line(line2)
@@ -72,10 +103,44 @@ def compute_pair_error(line1: str, line2: str):
     return rot_err_deg, trans_dist, (dx, dy, dz)
 
 
-def process_pairs(pairs: List[List[str]]) -> None:
+def compute_pair_error_centers(line1: str, line2: str):
+    q1, t1 = parse_pose_from_line(line1)
+    q2, t2 = parse_pose_from_line(line2)
+    c1 = camera_center_from_qt(q1, t1)
+    c2 = camera_center_from_qt(q2, t2)
+    dist, (dx, dy, dz) = translation_error(c1, c2)
+    rot_err_deg = rotation_error_deg(q1, q2)
+    return rot_err_deg, dist, (dx, dy, dz)
+
+
+# Keep old function name but parameterize the metric via a flag for reuse
+
+def process_pairs(pairs: List[List[str]], use_centers: bool = False, align_translation: bool = False) -> None:
     if not pairs:
         print("No pairs provided.")
         return
+
+    # Optional global translation alignment in camera-center space
+    offset = (0.0, 0.0, 0.0)
+    if align_translation:
+        # Estimate mean offset s that minimizes ||(C1 + s) - C2|| over pairs
+        dx_sum = dy_sum = dz_sum = 0.0
+        count = 0
+        for pair in pairs:
+            if len(pair) != 2:
+                continue
+            q1, t1 = parse_pose_from_line(pair[0])
+            q2, t2 = parse_pose_from_line(pair[1])
+            c1 = camera_center_from_qt(q1, t1)
+            c2 = camera_center_from_qt(q2, t2)
+            dx_sum += (c2[0] - c1[0])
+            dy_sum += (c2[1] - c1[1])
+            dz_sum += (c2[2] - c1[2])
+            count += 1
+        if count > 0:
+            offset = (dx_sum / count, dy_sum / count, dz_sum / count)
+            print(f"Applying global center offset (meters): {offset}")
+
     rot_errors: List[float] = []
     trans_errors: List[float] = []
     dx_list: List[float] = []
@@ -86,13 +151,28 @@ def process_pairs(pairs: List[List[str]]) -> None:
             print(f"Skipping entry {idx}: expected 2 lines, got {len(pair)}")
             continue
         line1, line2 = pair
-        rot_err_deg, trans_dist, (dx, dy, dz) = compute_pair_error(line1, line2)
+
+        if use_centers:
+            rot_err_deg, trans_dist, (dx, dy, dz) = compute_pair_error_centers(line1, line2)
+            # Apply global offset if requested
+            if align_translation:
+                # Apply estimated global offset s to predicted centers: (C1 + s) - C2
+                dx += offset[0]
+                dy += offset[1]
+                dz += offset[2]
+                trans_dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+        else:
+            rot_err_deg, trans_dist, (dx, dy, dz) = compute_pair_error(line1, line2)
+
         print(f"Pair {idx}: Rotational error: {rot_err_deg:.6f} deg")
-        print(f"Pair {idx}: Translational error (L2): {trans_dist:.6f}")
+        print(f"Pair {idx}: Translational error (L2): {trans_dist*100:.6f} cm")
         print(
             f"Pair {idx}: Per-axis translation delta (t1 - t2): "
-            f"dx={dx:.6f}, dy={dy:.6f}, dz={dz:.6f}"
+            f"dx={dx*100:.6f} cm, dy={dy*100:.6f} cm, dz={dz*100:.6f} cm"
         )
+        if(rot_err_deg > 10):
+            print("Big error: ", rot_err_deg)
+            continue
         rot_errors.append(rot_err_deg)
         trans_errors.append(trans_dist)
         dx_list.append(dx)
@@ -105,108 +185,128 @@ def process_pairs(pairs: List[List[str]]) -> None:
         avg_dy = sum(dy_list) / len(dy_list)
         avg_dz = sum(dz_list) / len(dz_list)
         print(f"Average rotational error: {avg_rot:.6f} deg")
-        print(f"Average translational error (L2): {avg_trans:.6f}")
+        print(f"Average translational error (L2): {avg_trans*100:.6f} cm")
         print(
             f"Average per-axis translation delta (t1 - t2): "
-            f"dx={avg_dx:.6f}, dy={avg_dy:.6f}, dz={avg_dz:.6f}"
+            f"dx={avg_dx*100:.6f} cm, dy={avg_dy*100:.6f} cm, dz={avg_dz*100:.6f} cm"
         )
 
 
+# ===== New helpers for file parsing and name mapping =====
+
+def parse_predictions_file(pred_path: str) -> Dict[str, str]:
+    """Parse a predictions file with lines: NAME qw qx qy qz tx ty tz.
+
+    Returns mapping NAME -> original line string.
+    """
+    name_to_line: Dict[str, str] = {}
+    with open(pred_path, 'r') as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            # Expect at least: name + 7 numbers
+            if len(parts) < 8:
+                continue
+            name = parts[0]
+            name_to_line[name] = line
+    return name_to_line
+
+
+def parse_colmap_images_txt(gt_images_path: str) -> Dict[str, str]:
+    """Parse COLMAP images.txt into mapping NAME -> original metadata line.
+
+    The images.txt format is two lines per image; we only take the first line which is:
+    IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
+    """
+    name_to_line: Dict[str, str] = {}
+    with open(gt_images_path, 'r') as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            # Heuristic: first token is IMAGE_ID (int), last is NAME, and there are >= 10 tokens
+            try:
+                _ = int(parts[0])
+            except Exception:
+                continue
+            if len(parts) < 10:
+                continue
+            name = parts[-1]
+            name_to_line[name] = line
+    return name_to_line
+
+
+def map_pred_name_to_gt_name(pred_name: str) -> Optional[str]:
+    """Map e.g. frame_0021.jpg -> frame_000200.jpg using rule: gt_idx = (idx-1)*10.
+
+    Returns None if the pattern cannot be parsed.
+    """
+    m = re.match(r"^(.*?)(\d+)(\.\w+)$", pred_name)
+    if not m:
+        return None
+    prefix, digits, suffix = m.groups()
+    try:
+        idx = int(digits)
+    except Exception:
+        return None
+    if idx <= 0:
+        return None
+    gt_idx = (idx - 1) * 10
+    # GT images use 6-digit zero padding as in examples
+    return f"{prefix}{gt_idx:06d}{suffix}"
+
+
+
 def main():
-    # Define your list of [line1, line2] pairs here
-    pairs: List[List[str]] = [
-        [
-            "frame_0283.jpg 0.61121935 0.61238429 0.35238566 -0.35668016 -2.95560394 1.92719296 0.14825538",
-            "242 0.623393 0.623624 0.328777 -0.338201 -2.1353 1.89435 1.71956 1 frame_002820.jpg",
-        ],
-        [
-            "frame_0816.jpg 0.58669496 0.63284002 0.35625867 -0.35830475 -2.99473443 1.93474735 0.40533786",
-            "718 0.596963 0.643566 0.335981 -0.34143 -2.30137 1.70746 2.11709 1 frame_008150.jpg",
-        ],
-        [
-            "frame_0719.jpg 0.34219882 0.34844806 0.62576049 -0.60820040 -2.11557172 1.76619976 2.66966293",
-            "635 0.352252 0.361109 0.622525 -0.598315 -1.43216 1.63696 2.67944 1 frame_007180.jpg",
-        ],
-        [
-            "frame_0659.jpg 0.08456995 -0.05157535 -0.89447958 0.43599791 1.96129040 -1.11738391 3.51460129",
-            "596 -0.074797 0.0551423 0.894126 -0.438068 3.04187 -1.42598 3.01129 1 frame_006580.jpg",
-        ],
-    ]
-    # pairs: List[List[str]] = [
-    #     [
-    #         "frame_0223.jpg 0.48060592 0.72622739 0.39776445 -0.28878223 -2.12631355 1.04781736 2.17917804",
-    #         "196 0.494903 0.71723 0.39695 -0.288242 -2.47685 0.816623 2.43163 1 frame_002220.jpg",
-    #     ],
-    #     [
-    #         "frame_0021.jpg 0.63301151 0.54355637 0.35904509 -0.41824577 -1.73195717 1.97337240 1.42231751",
-    #         "14 0.625944 0.549281 0.3596 -0.420917 -1.66833 2.01945 1.5345 1 frame_000200.jpg",
-    #     ],
-    #     [
-    #         "frame_0056.jpg 0.75458507 0.64872440 -0.07495499 0.06434109 -1.72828622 1.58801676 -1.68794386",
-    #         "49 0.754136 0.650895 -0.070399 0.0515645 -1.45047 1.63617 -1.70768 1 frame_000550.jpg",
-    #     ],
-    #     [
-    #         "frame_0212.jpg 0.77930586 0.61150198 0.08013668 -0.11102170 -2.81855864 1.68216254 -0.58736744",
-    #         "185 0.797858 0.584817 0.0734038 -0.126584 -3.44741 1.53376 -0.471858 1 frame_002110.jpg",
-    #     ],
-    #     [
-    #         "frame_0224.jpg 0.47743418 0.72375038 0.39925949 -0.29805007 -2.10969554 1.06616932 2.18763071",
-    #         "197 0.489119 0.718755 0.396938 -0.294269 -2.49374 0.847405 2.40637 1 frame_002230.jpg",
-    #     ],
-    #     [
-    #         "frame_0225.jpg 0.47384316 0.73370389 0.39411653 -0.28604795 -2.17658220 1.04197187 2.13061184",
-    #         "198 0.483597 0.728151 0.39367 -0.284524 -2.60027 0.835147 2.31962 1 frame_002240.jpg",
-    #     ],
-    #     [
-    #         "frame_0226.jpg 0.46162784 0.73723505 0.39727894 -0.29249558 -2.15412601 1.03316281 2.17398427",
-    #         "199 0.47233 0.733856 0.394279 -0.287933 -2.61912 0.845583 2.31691 1 frame_002250.jpg",
-    #     ],
-    #     [
-    #         "frame_0227.jpg 0.45494583 0.74424219 0.39408926 -0.28951944 -2.17326499 1.03091369 2.16926523",
-    #         "200 0.465916 0.740351 0.391307 -0.285799 -2.66903 0.860439 2.27046 1 frame_002260.jpg",
-    #     ],
-    #     [
-    #         "frame_0228.jpg 0.45115199 0.74967119 0.39083654 -0.28583524 -2.19339627 1.02920680 2.14546595",
-    #         "201 0.46116 0.744657 0.389726 -0.284483 -2.7136 0.871448 2.22418 1 frame_002270.jpg",
-    #     ],
-    #     [
-    #         "frame_0229.jpg 0.43401776 0.76137532 0.40300258 -0.26367618 -2.26757065 0.86576814 2.14794612",
-    #         "202 0.445134 0.756729 0.401512 -0.260777 -2.81688 0.704531 2.15886 1 frame_002280.jpg",
-    #     ],
-    #     [
-    #         "frame_0230.jpg 0.41376488 0.77235058 0.41768759 -0.24043771 -2.32945703 0.67715722 2.12636084",
-    #         "203 0.423336 0.768596 0.416226 -0.238335 -2.89912 0.525012 2.10095 1 frame_002290.jpg",
-    #     ],
-    #     [
-    #         "frame_0231.jpg 0.40616087 0.78393102 0.41624779 -0.21730917 -2.42506343 0.60108556 2.03554272",
-    #         "204 0.415771 0.779794 0.415312 -0.215806 -3.02063 0.471294 1.94338 1 frame_002300.jpg",
-    #     ],
-    #     [
-    #         "frame_0232.jpg 0.39124778 0.80049125 0.40584267 -0.20354524 -2.48226491 0.59416776 1.97768312",
-    #         "205 0.403002 0.796446 0.405454 -0.197153 -3.11521 0.496107 1.79201 1 frame_002310.jpg",
-    #     ],
-    #     [
-    #         "frame_0233.jpg 0.38897313 0.80281213 0.40659974 -0.19715281 -2.51469859 0.57814767 1.93747919",
-    #         "206 0.398875 0.798946 0.407343 -0.191458 -3.17121 0.503732 1.72593 1 frame_002320.jpg",
-    #     ],
-    #     [
-    #         "frame_0234.jpg 0.39072512 0.80119234 0.40826058 -0.19684514 -2.53589030 0.59643917 1.90886339",
-    #         "207 0.403738 0.795006 0.410142 -0.191689 -3.22326 0.532162 1.65548 1 frame_002330.jpg",
-    #     ],
-    #     [
-    #         "frame_0235.jpg 0.40594210 0.78996050 0.41420379 -0.19901920 -2.56971724 0.60801135 1.87359724",
-    #         "208 0.412489 0.786424 0.415216 -0.197447 -3.28225 0.572281 1.60676 1 frame_002340.jpg",
-    #     ],
-    #     [
-    #         "frame_0238.jpg 0.41073291 0.75624250 0.45073240 -0.23714143 -2.47575923 0.61323528 2.03896533",
-    #         "211 0.415401 0.751265 0.454136 -0.238334 -3.32664 0.588975 1.7818 1 frame_002370.jpg",
-    #     ],
-    #     [
-    #         "frame_0236.jpg 0.40968002 0.78104322 0.42587585 -0.20189982 -2.58104329 0.58586927 1.87398663",
-    #         "209 0.415653 0.776142 0.428049 -0.203986 -3.33674 0.562238 1.6109 1 frame_002350.jpg",
-    #     ],
-    # ]
-    process_pairs(pairs)
+    parser = argparse.ArgumentParser(description="Compute pose errors between predictions and COLMAP GT using name mapping.")
+    parser.add_argument("--pred", required=True, help="Path to predictions file (absolute_poses.txt)")
+    parser.add_argument("--gt_images", required=True, help="Path to COLMAP images.txt (ground truth)")
+    parser.add_argument("--use_centers", action="store_true", help="Measure translation error on camera centers (origin-shift robust)")
+    parser.add_argument("--align_translation", action="store_true", help="Estimate and remove a single global center offset before measuring errors")
+    args = parser.parse_args()
+
+    pred_map = parse_predictions_file(args.pred)
+    gt_map = parse_colmap_images_txt(args.gt_images)
+
+    if not pred_map:
+        print("No predictions parsed.")
+        return
+    if not gt_map:
+        print("No GT images parsed.")
+        return
+
+    pairs: List[List[str]] = []
+    missing: List[str] = []
+
+    cnt = 1
+    for pred_name, pred_line in pred_map.items():
+        gt_name = map_pred_name_to_gt_name(pred_name)
+        print(f"pred_name: {cnt}", pred_name, "gt_name: ", gt_name)
+        cnt += 1
+        if gt_name is None:
+            missing.append(pred_name)
+            continue
+        gt_line = gt_map.get(gt_name)
+        if gt_line is None:
+            missing.append(pred_name)
+            continue
+        pairs.append([pred_line, gt_line])
+
+    if missing:
+        print(f"Warning: {len(missing)} predictions had no matching GT and were skipped.")
+        # Uncomment to list missing names
+        # for n in missing:
+        #     print(f"  missing GT for {n}")
+
+    if not pairs:
+        print("No valid prediction/GT pairs to evaluate.")
+        return
+
+    # Report and summarize
+    process_pairs(pairs, use_centers=args.use_centers, align_translation=args.align_translation)
 
 
 if __name__ == "__main__":

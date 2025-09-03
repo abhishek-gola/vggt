@@ -53,14 +53,37 @@ def batch_np_matrix_to_pycolmap(
 
     reproj_mask = None
 
-    if max_reproj_error is not None:
-        projected_points_2d, projected_points_cam = project_3D_points_np(points3d, extrinsics, intrinsics)
-        projected_diff = np.linalg.norm(projected_points_2d - tracks, axis=-1)
-        projected_points_2d[projected_points_cam[:, -1] <= 0] = 1e6
-        reproj_mask = projected_diff < max_reproj_error
-        print("projection error: ", projected_diff)
-        print("max_reproj_error: ", max_reproj_error)
-        print("reproj_mask: ", reproj_mask)
+    # Compute reprojection error with strict visibility gating (cheirality + image bounds)
+    projected_points_2d, projected_points_cam = project_3D_points_np(points3d, extrinsics, intrinsics)
+    # Cheirality: keep points in front of the camera
+    valid_z = projected_points_cam[:, 2, :] > 0
+    # Image bounds
+    width, height = int(image_size[1]), int(image_size[0])
+    u = projected_points_2d[..., 0]
+    v = projected_points_2d[..., 1]
+    in_bounds = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    valid_vis = valid_z & in_bounds & np.isfinite(u) & np.isfinite(v)
+
+    projected_diff = np.linalg.norm(projected_points_2d - tracks, axis=-1)
+    # Invalidate non-visible projections so they are never considered inliers
+    projected_diff[~valid_vis] = np.inf
+
+    # If no explicit threshold is given, derive a robust one from the data
+    if (max_reproj_error is None) or (max_reproj_error <= 0):
+        finite_err = projected_diff[np.isfinite(projected_diff)]
+        if finite_err.size > 0:
+            med = np.median(finite_err)
+            mad = 1.4826 * np.median(np.abs(finite_err - med))
+            max_reproj_error = max(1.0, med + 3.0 * mad)
+        else:
+            max_reproj_error = 2.0  # sensible default in pixels
+
+    reproj_mask = projected_diff < max_reproj_error
+    # Optional lightweight logging
+    print(
+        f"reproj_err_px: median={np.nanmedian(projected_diff):.2f}, thr={max_reproj_error:.2f}, "
+        f"inliers/frame min={reproj_mask.sum(1).min()} max={reproj_mask.sum(1).max()}"
+    )
 
     if masks is not None and reproj_mask is not None:
         masks = np.logical_and(masks, reproj_mask)
